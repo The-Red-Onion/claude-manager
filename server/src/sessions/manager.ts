@@ -161,6 +161,7 @@ export class SessionManager extends EventEmitter {
     const clean = name.trim().slice(0, 60);
     if (!s || !clean) return false;
     s.info.name = clean;
+    this.emit("session_renamed", id, clean);
     this.emit("sessions_changed");
     return true;
   }

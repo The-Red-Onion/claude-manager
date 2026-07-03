@@ -486,19 +486,27 @@ export class TelegramBridge {
       const threadId = topic.message_thread_id;
       this.sessionTopic.set(info.id, { chatId: gid, threadId });
       this.threadSession.set(threadId, info.id);
-      const header = await this.bot.api.sendMessage(
-        gid,
-        `${emoji} <b>${esc(info.name)}</b>\n<code>${esc(info.cwd)}</code>\n\nType here to send tasks.`,
-        {
-          parse_mode: "HTML",
-          message_thread_id: threadId,
-          reply_markup: this.sessionKeyboard(info.id),
-        },
-      );
-      this.trackMsg(gid, header.message_id, info.id);
+      // No header message on purpose — the topic name is the session; just
+      // type in it. Control buttons live on the working/result messages.
     } catch (e) {
       if (e instanceof GrammyError) console.error("[telegram] topic:", e.description);
     }
+  }
+
+  private topicEmoji(kind?: string): string {
+    return kind === "claude" ? "✦" : kind === "docker" ? "🐳" : "❯";
+  }
+
+  /** Keep the forum topic's name in sync when a session is renamed. */
+  private async renameTopic(sessionId: string, name: string) {
+    const topic = this.sessionTopic.get(sessionId);
+    if (!topic || !this.bot) return;
+    const emoji = this.topicEmoji(this.manager.info(sessionId)?.kind);
+    await this.bot.api
+      .editForumTopic(topic.chatId, topic.threadId, {
+        name: `${emoji} ${name}`.slice(0, 96),
+      })
+      .catch(() => {});
   }
 
   private async closeTopic(sessionId: string) {
@@ -740,7 +748,11 @@ export class TelegramBridge {
       const msg = await this.bot.api.sendMessage(
         target.chatId,
         `🟢 <b>${esc(this.name(sessionId))}</b> — working…`,
-        { parse_mode: "HTML", message_thread_id: target.threadId },
+        {
+          parse_mode: "HTML",
+          message_thread_id: target.threadId,
+          reply_markup: this.sessionKeyboard(sessionId),
+        },
       );
       this.status.set(sessionId, {
         chatId: target.chatId,
@@ -849,6 +861,9 @@ export class TelegramBridge {
 
   private wireManager() {
     this.manager.on("session_created", (info: SessionInfo) => void this.ensureTopic(info));
+    this.manager.on("session_renamed", (id: string, name: string) =>
+      void this.renameTopic(id, name),
+    );
     this.manager.on("ask", (id: string, ask: PendingAsk) => this.notifyAsk(id, ask));
     this.manager.on("done", (id: string, summary: { text: string; isError: boolean }) =>
       this.notifyDone(id, summary),
