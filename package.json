@@ -1,8 +1,8 @@
 {
-  "name": "claude-manager",
+  "name": "chill-vibe-w-claude",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hosted control center for Claude Code: session multiplexer, web dashboard, full terminal, Docker and a Telegram bot remote.",
+  "description": "chill & vibe w/ claude — self-hosted control center for Claude Code: session multiplexer, web dashboard, full terminal, Docker, and a Telegram bot remote (forum topics, voice, laptop handoff).",
   "type": "module",
   "scripts": {
     "dev": "pnpm --parallel -r dev",

@@ -111,18 +111,29 @@ export function safeFilename(name: string): string {
 
 export function sessionLine(s: SessionInfo): string {
   const kind = KIND_EMOJI[s.kind] ?? "•";
-  const preview = s.preview ? ` — <i>${esc(s.preview.slice(0, 60))}</i>` : "";
-  return `${STATUS_EMOJI[s.status]} ${kind} <b>${esc(s.name)}</b>${preview}`;
+  const preview = s.preview ? ` — <i>${esc(s.preview.slice(0, 50))}</i>` : "";
+  const when =
+    s.status === "working" || s.status === "starting"
+      ? ""
+      : ` <i>· ${timeAgo(s.lastActivityAt)} ago</i>`;
+  return `${STATUS_EMOJI[s.status]} ${kind} <b>${esc(s.name)}</b>${when}${preview}`;
 }
 
-export function sessionDetail(s: SessionInfo): string {
+export function sessionDetail(
+  s: SessionInfo,
+  lastAnswer?: string | null,
+): string {
   const lines = [
     `${STATUS_EMOJI[s.status]} <b>${esc(s.name)}</b> · ${s.kind}`,
     `<code>${esc(s.cwd)}</code>`,
-    `status: ${STATUS_LABEL[s.status]}`,
+    `status: ${STATUS_LABEL[s.status]} · <i>${timeAgo(s.lastActivityAt)} ago</i>`,
   ];
   if (s.stats.costUsd != null)
     lines.push(`cost: $${s.stats.costUsd.toFixed(3)} · turns: ${s.stats.turns ?? 0}`);
   if (s.pendingAsk) lines.push(`⏳ <b>${esc(s.pendingAsk.title)}</b>`);
+  if (lastAnswer && lastAnswer.trim()) {
+    const snip = lastAnswer.trim().replace(/\s+/g, " ").slice(0, 320);
+    lines.push("", `💬 <i>${esc(snip)}${lastAnswer.length > 320 ? "…" : ""}</i>`);
+  }
   return lines.join("\n");
 }

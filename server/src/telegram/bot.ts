@@ -33,12 +33,21 @@ const ATTACH_EXT = new Set([
   "txt", "md", "html", "epub",
 ]);
 
+/** Forum-topic header colors (from Telegram's allowed palette), by kind. */
+type TopicColor = 0x6fb9f0 | 0xffd67e | 0xcb86db | 0x8eee98 | 0xff93b2 | 0xfb6f5f;
+const TOPIC_COLOR: Record<string, TopicColor> = {
+  claude: 0x8eee98, // green
+  shell: 0x6fb9f0, // blue
+  docker: 0xcb86db, // purple
+};
+
 /** Pinned command menu (the "/" button next to the input box). */
 const BOT_COMMANDS = [
   { command: "sessions", description: "📋 List & open sessions" },
   { command: "new", description: "✦ New Claude session — /new <task>" },
   { command: "adopt", description: "📲 Continue a session from your laptop" },
   { command: "term", description: "❯ New terminal (shell)" },
+  { command: "bindgroup", description: "🧵 Use this supergroup — a topic per session" },
   { command: "model", description: "🧠 Switch model of current session" },
   { command: "effort", description: "🎚 Default reasoning effort" },
   { command: "rename", description: "✏️ Rename current session — /rename <name>" },
@@ -56,6 +65,7 @@ interface StatusMsg {
 
 interface ShellCapture {
   chatId: number;
+  threadId?: number;
   buf: string;
   timer: NodeJS.Timeout | null;
   startedAt: number;
@@ -77,6 +87,12 @@ export class TelegramBridge {
   private status = new Map<string, StatusMsg>();
   /** sessionId -> pending terminal output capture (after a TG command). */
   private shellCapture = new Map<string, ShellCapture>();
+  /** sessionId -> its forum topic in the bound supergroup. */
+  private sessionTopic = new Map<string, { chatId: number; threadId: number }>();
+  /** forum topic id -> sessionId, for plain-text routing inside a topic. */
+  private threadSession = new Map<number, string>();
+  /** chatId -> last time we showed the "reply to route" hint. */
+  private lastHint = new Map<number, number>();
   private started = false;
 
   constructor(
@@ -127,26 +143,73 @@ export class TelegramBridge {
     }
   }
 
-  /** Reply-to a session message → that session; otherwise the current one. */
+  private groupId(): number | null {
+    return this.config.get().telegram.groupChatId;
+  }
+
+  /** The session bound to the forum topic this message sits in, if any. */
+  private threadTarget(ctx: any): string | null {
+    const gid = this.groupId();
+    const threadId = ctx.message?.message_thread_id;
+    if (gid && ctx.chat?.id === gid && threadId) {
+      const sid = this.threadSession.get(threadId);
+      if (sid && this.manager.info(sid)) return sid;
+    }
+    return null;
+  }
+
+  /**
+   * Where a plain message routes:
+   * - inside a session's forum topic → that session (no reply needed);
+   * - in private → only when it replies to one of that session's messages.
+   * Resolving also marks the session "current" for follow-up commands.
+   */
   private routeTarget(ctx: any): string | null {
+    const viaThread = this.threadTarget(ctx);
+    if (viaThread) {
+      this.current.set(ctx.chat.id, viaThread);
+      return viaThread;
+    }
     const replyTo = ctx.message?.reply_to_message?.message_id;
     if (replyTo) {
       const sid = this.msgSessions.get(`${ctx.chat.id}:${replyTo}`);
-      if (sid && this.manager.info(sid)) return sid;
+      if (sid && this.manager.info(sid)) {
+        this.current.set(ctx.chat.id, sid);
+        return sid;
+      }
     }
+    return null;
+  }
+
+  /** Session a command acts on: the topic's session, else the current one. */
+  private ctxSessionId(ctx: any): string | null {
+    const viaThread = this.threadTarget(ctx);
+    if (viaThread) return viaThread;
     const id = this.current.get(ctx.chat.id);
     return id && this.manager.info(id) ? id : null;
   }
 
-  /** Send a task to a session + start live feedback. */
+  /** Where session output goes: its forum topic, else the private notify chat. */
+  private sessionTarget(sessionId: string): { chatId: number; threadId?: number } | null {
+    const topic = this.sessionTopic.get(sessionId);
+    if (topic) return { chatId: topic.chatId, threadId: topic.threadId };
+    const chatId = this.notifyChat();
+    return chatId ? { chatId } : null;
+  }
+
+  /** Send a task to a session + start live feedback in the session's home. */
   private async dispatch(ctx: any, sessionId: string, text: string) {
     const info = this.manager.info(sessionId);
     if (!info || !this.manager.sendMessage(sessionId, text)) return;
     await ctx.react("👀").catch(() => {});
+    const target = this.sessionTarget(sessionId) ?? {
+      chatId: ctx.chat.id,
+      threadId: ctx.message?.message_thread_id,
+    };
     if (info.kind === "claude") {
-      await this.startStatus(ctx.chat.id, sessionId);
+      await this.startStatus(target, sessionId);
     } else {
-      this.armShellCapture(ctx.chat.id, sessionId);
+      this.armShellCapture(target, sessionId);
     }
   }
 
@@ -177,14 +240,15 @@ export class TelegramBridge {
           "/new &lt;task&gt; — new Claude session",
           "/adopt — continue a session from your laptop",
           "/term — new terminal (shell)",
+          "/bindgroup — use a supergroup: a topic per session",
           "/rename &lt;name&gt; — rename current session",
           "/model — switch model (live)",
           "/effort — default reasoning effort",
           "/get &lt;path&gt; — fetch a file from this machine",
           "/kill — close current session",
           "",
-          "Pick a session, then just type — or send a voice note or a file.",
-          "Reply to any session message to route to that session.",
+          "<b>Routing:</b> reply to a session's message (or voice/file) to send it there — nothing fires on a stray message, so no accidents.",
+          "Bind a supergroup and each session becomes its own topic, where you can just type.",
         ].join("\n"),
         { parse_mode: "HTML", reply_markup: this.mainKeyboard() },
       );
@@ -205,7 +269,11 @@ export class TelegramBridge {
         { parse_mode: "HTML", reply_markup: this.sessionKeyboard(info.id) },
       );
       this.trackMsg(ctx.chat.id, msg.message_id, info.id);
-      if (prompt) await this.startStatus(ctx.chat.id, info.id);
+      if (prompt)
+        await this.startStatus(
+          this.sessionTarget(info.id) ?? { chatId: ctx.chat.id },
+          info.id,
+        );
     });
 
     bot.command("term", async (ctx) => {
@@ -220,17 +288,20 @@ export class TelegramBridge {
     });
 
     bot.command("kill", async (ctx) => {
-      const id = this.current.get(ctx.chat.id);
+      if (!this.allowed(ctx.from?.id)) return;
+      const id = this.ctxSessionId(ctx);
       if (id && this.manager.kill(id)) {
         this.current.delete(ctx.chat.id);
         await ctx.reply("🗑 Session closed.");
-      } else await ctx.reply("No current session.");
+      } else await ctx.reply("No current session — reply in its topic or /sessions.");
     });
+
+    bot.command("bindgroup", (ctx) => this.onBindGroup(ctx));
 
     bot.command("rename", async (ctx) => {
       if (!this.allowed(ctx.from?.id)) return;
       const name = ctx.match?.toString().trim();
-      const id = this.current.get(ctx.chat.id);
+      const id = this.ctxSessionId(ctx);
       if (!id || !this.manager.info(id)) {
         return this.replySessions(ctx.chat.id, "Pick a session first:");
       }
@@ -271,7 +342,7 @@ export class TelegramBridge {
 
     bot.command("model", async (ctx) => {
       if (!this.allowed(ctx.from?.id)) return;
-      const id = this.current.get(ctx.chat.id);
+      const id = this.ctxSessionId(ctx);
       const info = id ? this.manager.info(id) : undefined;
       if (!id || !info || info.kind !== "claude") {
         return void ctx.reply("Pick a Claude session first: /sessions");
@@ -335,9 +406,109 @@ export class TelegramBridge {
       const text = ctx.message.text;
       if (text.startsWith("/")) return;
       const id = this.routeTarget(ctx);
-      if (!id) return this.replySessions(ctx.chat.id, "Pick a session first:");
+      if (!id) return this.hintNoRoute(ctx);
       await this.dispatch(ctx, id, text);
     });
+  }
+
+  /** Nothing happens on a stray message — tell the user how to route, gently. */
+  private async hintNoRoute(ctx: any) {
+    const chatId = ctx.chat.id;
+    const now = Date.now();
+    if (now - (this.lastHint.get(chatId) ?? 0) < 45_000) return;
+    this.lastHint.set(chatId, now);
+    const inGroup = this.groupId() && chatId === this.groupId();
+    await ctx
+      .reply(
+        inGroup
+          ? "↩️ Write inside a session's topic, or reply to a session message."
+          : "↩️ Reply to a session's message to send it there. /sessions to list.",
+        { reply_markup: this.mainKeyboard() },
+      )
+      .catch(() => {});
+  }
+
+  // ---- supergroup binding + forum topics ----
+
+  private async onBindGroup(ctx: any) {
+    if (!this.allowed(ctx.from?.id)) return;
+    const chat = ctx.chat;
+    if (chat?.type !== "supergroup" || !chat.is_forum) {
+      return void ctx.reply(
+        "Run /bindgroup inside a <b>supergroup with Topics enabled</b>, where I'm an admin with “Manage Topics”.",
+        { parse_mode: "HTML" },
+      );
+    }
+    const tg = this.config.get().telegram;
+    let filesTopicId = tg.filesTopicId;
+    try {
+      const files = await ctx.api.createForumTopic(chat.id, "📁 Files", {
+        icon_color: 0xffd67e,
+      });
+      filesTopicId = files.message_thread_id;
+    } catch {
+      /* maybe already there, or missing rights — handled below */
+    }
+    this.config.update({
+      telegram: { ...tg, groupChatId: chat.id, filesTopicId },
+    });
+    await ctx.reply(
+      [
+        "🧵 <b>Bound to this supergroup.</b>",
+        "",
+        "Every session now gets its own topic here, auto-sorted.",
+        "Just type inside a topic to talk to that session — no reply needed.",
+        filesTopicId ? "All files I send are archived in <b>📁 Files</b>." : "",
+        "",
+        "<i>If topics didn't get created, make me an admin with “Manage Topics”.</i>",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      { parse_mode: "HTML" },
+    );
+    // Give existing live sessions their topics too.
+    for (const s of this.manager.list()) {
+      if (s.status !== "exited") await this.ensureTopic(s);
+    }
+  }
+
+  private async ensureTopic(info: SessionInfo) {
+    const gid = this.groupId();
+    if (!this.bot || !gid || this.sessionTopic.has(info.id)) return;
+    const color = TOPIC_COLOR[info.kind] ?? 0x6fb9f0;
+    const emoji = info.kind === "claude" ? "✦" : info.kind === "docker" ? "🐳" : "❯";
+    try {
+      const topic = await this.bot.api.createForumTopic(
+        gid,
+        `${emoji} ${info.name}`.slice(0, 96),
+        { icon_color: color },
+      );
+      const threadId = topic.message_thread_id;
+      this.sessionTopic.set(info.id, { chatId: gid, threadId });
+      this.threadSession.set(threadId, info.id);
+      const header = await this.bot.api.sendMessage(
+        gid,
+        `${emoji} <b>${esc(info.name)}</b>\n<code>${esc(info.cwd)}</code>\n\nType here to send tasks.`,
+        {
+          parse_mode: "HTML",
+          message_thread_id: threadId,
+          reply_markup: this.sessionKeyboard(info.id),
+        },
+      );
+      this.trackMsg(gid, header.message_id, info.id);
+    } catch (e) {
+      if (e instanceof GrammyError) console.error("[telegram] topic:", e.description);
+    }
+  }
+
+  private async closeTopic(sessionId: string) {
+    const topic = this.sessionTopic.get(sessionId);
+    if (!topic || !this.bot) return;
+    this.sessionTopic.delete(sessionId);
+    this.threadSession.delete(topic.threadId);
+    await this.bot.api
+      .closeForumTopic(topic.chatId, topic.threadId)
+      .catch(() => {});
   }
 
   // ---- voice ----
@@ -428,10 +599,29 @@ export class TelegramBridge {
         this.manager.interrupt(rest[0]);
         await ctx.answerCallbackQuery({ text: "⏹ Interrupted" });
       } else if (tag === "k") {
+        void this.closeTopic(rest[0]);
         this.manager.kill(rest[0]);
         this.current.delete(chatId);
         await ctx.answerCallbackQuery({ text: "🗑 Closed" });
         await ctx.editMessageText("🗑 Session closed.").catch(() => {});
+      } else if (tag === "md") {
+        const sid = rest[0];
+        const last = this.manager.lastAnswer(sid);
+        const info = this.manager.info(sid);
+        if (!last || !last.text.trim()) {
+          await ctx.answerCallbackQuery({ text: "No answer yet" });
+        } else {
+          await ctx.answerCallbackQuery({ text: "📎 Sending…" });
+          const threadId = ctx.callbackQuery?.message?.message_thread_id;
+          await this.sendDoc(
+            chatId,
+            new InputFile(
+              Buffer.from(last.text, "utf8"),
+              `${safeFilename(info?.name ?? sid)}-answer.md`,
+            ),
+            { sessionId: sid, threadId, archive: false },
+          );
+        }
       } else if (tag === "list") {
         await ctx.answerCallbackQuery();
         await this.replySessions(chatId);
@@ -484,20 +674,21 @@ export class TelegramBridge {
   // ---- rendering ----
 
   private mainKeyboard(): InlineKeyboard {
-    const kb = new InlineKeyboard()
+    return new InlineKeyboard()
       .text("📋 Sessions", "list")
       .text("✦ New Claude", "new");
-    const url = this.webUrl();
-    if (/^https:\/\//.test(url)) kb.row().webApp("🖥 Open dashboard", url);
-    return kb;
   }
 
   private sessionKeyboard(id: string): InlineKeyboard {
-    return new InlineKeyboard()
+    const kb = new InlineKeyboard()
       .text("⏹ Interrupt", `i:${id}`)
       .text("🗑 Close", `k:${id}`)
-      .row()
-      .text("📋 All sessions", "list");
+      .row();
+    if (this.manager.info(id)?.kind === "claude") {
+      kb.text("📎 Full answer (.md)", `md:${id}`).row();
+    }
+    kb.text("📋 All sessions", "list");
+    return kb;
   }
 
   private async replySessions(chatId: number, header = "Your sessions:") {
@@ -528,7 +719,7 @@ export class TelegramBridge {
     const info = this.manager.info(id);
     if (!info) return;
     await ctx
-      .editMessageText(sessionDetail(info), {
+      .editMessageText(sessionDetail(info, this.manager.lastAnswer(id)?.text), {
         parse_mode: "HTML",
         reply_markup: this.sessionKeyboard(id),
       })
@@ -540,21 +731,24 @@ export class TelegramBridge {
 
   // ---- live status message ----
 
-  private async startStatus(chatId: number, sessionId: string) {
+  private async startStatus(
+    target: { chatId: number; threadId?: number },
+    sessionId: string,
+  ) {
     if (!this.bot || this.status.has(sessionId)) return;
     try {
       const msg = await this.bot.api.sendMessage(
-        chatId,
+        target.chatId,
         `🟢 <b>${esc(this.name(sessionId))}</b> — working…`,
-        { parse_mode: "HTML" },
+        { parse_mode: "HTML", message_thread_id: target.threadId },
       );
       this.status.set(sessionId, {
-        chatId,
+        chatId: target.chatId,
         messageId: msg.message_id,
         lastText: "",
         timer: null,
       });
-      this.trackMsg(chatId, msg.message_id, sessionId);
+      this.trackMsg(target.chatId, msg.message_id, sessionId);
     } catch (e) {
       if (e instanceof GrammyError) console.error("[telegram]", e.description);
     }
@@ -597,10 +791,19 @@ export class TelegramBridge {
 
   // ---- terminal output capture ----
 
-  private armShellCapture(chatId: number, sessionId: string) {
+  private armShellCapture(
+    target: { chatId: number; threadId?: number },
+    sessionId: string,
+  ) {
     const existing = this.shellCapture.get(sessionId);
     if (existing?.timer) clearTimeout(existing.timer);
-    const cap: ShellCapture = { chatId, buf: "", timer: null, startedAt: Date.now() };
+    const cap: ShellCapture = {
+      chatId: target.chatId,
+      threadId: target.threadId,
+      buf: "",
+      timer: null,
+      startedAt: Date.now(),
+    };
     this.shellCapture.set(sessionId, cap);
     // Flush even if the command produces no output at all.
     cap.timer = setTimeout(() => void this.flushShell(sessionId), 2500);
@@ -629,12 +832,15 @@ export class TelegramBridge {
     const name = info?.name ?? sessionId;
     const tail = clean.length > 3000 ? clean.slice(-3000) : clean;
     const html = `❯ <b>${esc(name)}</b>\n<pre><code>${esc(tail)}</code></pre>`;
-    const sent = await this.sendHtml(cap.chatId, html, { sessionId });
+    const sent = await this.sendHtml(cap.chatId, html, {
+      sessionId,
+      threadId: cap.threadId,
+    });
     if (sent && clean.length > 3000) {
       await this.sendDoc(
         cap.chatId,
         new InputFile(Buffer.from(clean, "utf8"), `${safeFilename(name)}-output.txt`),
-        sessionId,
+        { sessionId, threadId: cap.threadId },
       );
     }
   }
@@ -642,12 +848,13 @@ export class TelegramBridge {
   // ---- manager → telegram notifications ----
 
   private wireManager() {
+    this.manager.on("session_created", (info: SessionInfo) => void this.ensureTopic(info));
     this.manager.on("ask", (id: string, ask: PendingAsk) => this.notifyAsk(id, ask));
     this.manager.on("done", (id: string, summary: { text: string; isError: boolean }) =>
       this.notifyDone(id, summary),
     );
     this.manager.on("session_error", (id: string, message: string) =>
-      this.notify(`🔴 <b>${esc(this.name(id))}</b> error:\n${esc(message)}`, undefined, id),
+      this.notify(`🔴 <b>${esc(this.name(id))}</b> error:\n${esc(message)}`, { sessionId: id }),
     );
     this.manager.on("chat_event", (id: string, e: ChatEvent) => this.onChatEvent(id, e));
     this.manager.on("output", (id: string, data: string) => this.onShellOutput(id, data));
@@ -673,29 +880,51 @@ export class TelegramBridge {
     return this.config.get().telegram.notifyChatId;
   }
 
+  /** Run a Telegram call, retrying once when rate-limited (429). */
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof GrammyError && e.error_code === 429) {
+        const wait = Math.min(((e.parameters?.retry_after ?? 1) + 0.5) * 1000, 15000);
+        await new Promise((r) => setTimeout(r, wait));
+        return fn();
+      }
+      throw e;
+    }
+  }
+
   /** Send HTML with graceful plain-text fallback. Returns true if delivered. */
   private async sendHtml(
     chatId: number,
     html: string,
-    opts: { keyboard?: InlineKeyboard; sessionId?: string } = {},
+    opts: { keyboard?: InlineKeyboard; sessionId?: string; threadId?: number } = {},
   ): Promise<boolean> {
     if (!this.bot) return false;
+    const bot = this.bot;
+    const track = (id: number) => {
+      if (opts.sessionId) this.trackMsg(chatId, id, opts.sessionId);
+    };
     try {
-      const msg = await this.bot.api.sendMessage(chatId, html, {
-        parse_mode: "HTML",
-        reply_markup: opts.keyboard,
-      });
-      if (opts.sessionId) this.trackMsg(chatId, msg.message_id, opts.sessionId);
+      const msg = await this.withRetry(() =>
+        bot.api.sendMessage(chatId, html, {
+          parse_mode: "HTML",
+          reply_markup: opts.keyboard,
+          message_thread_id: opts.threadId,
+        }),
+      );
+      track(msg.message_id);
       return true;
     } catch (e) {
       if (!(e instanceof GrammyError)) return false;
       try {
-        const msg = await this.bot.api.sendMessage(
-          chatId,
-          htmlToPlain(html).slice(0, 4000),
-          { reply_markup: opts.keyboard },
+        const msg = await this.withRetry(() =>
+          bot.api.sendMessage(chatId, htmlToPlain(html).slice(0, 4000), {
+            reply_markup: opts.keyboard,
+            message_thread_id: opts.threadId,
+          }),
         );
-        if (opts.sessionId) this.trackMsg(chatId, msg.message_id, opts.sessionId);
+        track(msg.message_id);
         return true;
       } catch (e2) {
         if (e2 instanceof GrammyError) console.error("[telegram]", e2.description);
@@ -704,25 +933,57 @@ export class TelegramBridge {
     }
   }
 
-  private async sendDoc(chatId: number, file: InputFile, sessionId?: string) {
+  private async sendDoc(
+    chatId: number,
+    file: InputFile,
+    opts: { sessionId?: string; threadId?: number; archive?: boolean } = {},
+  ) {
     if (!this.bot) return;
+    const bot = this.bot;
     try {
-      const msg = await this.bot.api.sendDocument(chatId, file);
-      if (sessionId) this.trackMsg(chatId, msg.message_id, sessionId);
+      const msg = await this.withRetry(() =>
+        bot.api.sendDocument(chatId, file, { message_thread_id: opts.threadId }),
+      );
+      if (opts.sessionId) this.trackMsg(chatId, msg.message_id, opts.sessionId);
+      if (opts.archive !== false) await this.archiveDoc(chatId, msg.message_id);
     } catch (e) {
       if (e instanceof GrammyError) console.error("[telegram]", e.description);
     }
   }
 
-  private async notify(html: string, keyboard?: InlineKeyboard, sessionId?: string) {
-    const chatId = this.notifyChat();
-    if (!chatId) return;
-    await this.sendHtml(chatId, html, { keyboard, sessionId });
+  /** Keep a copy of every file the bot sends in the group's 📁 Files topic. */
+  private async archiveDoc(fromChatId: number, messageId: number) {
+    const tg = this.config.get().telegram;
+    if (!this.bot || !tg.groupChatId || !tg.filesTopicId) return;
+    if (fromChatId === tg.groupChatId && messageId === tg.filesTopicId) return;
+    await this.bot.api
+      .copyMessage(tg.groupChatId, fromChatId, messageId, {
+        message_thread_id: tg.filesTopicId,
+      })
+      .catch(() => {});
+  }
+
+  private async notify(
+    html: string,
+    opts: { keyboard?: InlineKeyboard; sessionId?: string } = {},
+  ) {
+    const target = opts.sessionId
+      ? this.sessionTarget(opts.sessionId)
+      : this.notifyChat()
+        ? { chatId: this.notifyChat()! }
+        : null;
+    if (!target) return;
+    await this.sendHtml(target.chatId, html, {
+      keyboard: opts.keyboard,
+      sessionId: opts.sessionId,
+      threadId: target.threadId,
+    });
   }
 
   private async notifyAsk(sessionId: string, ask: PendingAsk) {
-    const chatId = this.notifyChat();
-    if (!this.bot || !chatId) return;
+    const target = this.sessionTarget(sessionId);
+    if (!this.bot || !target) return;
+    const bot = this.bot;
     const kb = new InlineKeyboard();
     ask.options.forEach((o, i) => {
       kb.text(o.label, `a:${sessionId}:${ask.id}:${o.key}`);
@@ -738,12 +999,15 @@ export class TelegramBridge {
       .filter(Boolean)
       .join("\n");
     try {
-      const msg = await this.bot.api.sendMessage(chatId, body, {
-        parse_mode: "HTML",
-        reply_markup: kb,
-      });
-      this.askMessages.set(ask.id, { chatId, messageId: msg.message_id });
-      this.trackMsg(chatId, msg.message_id, sessionId);
+      const msg = await this.withRetry(() =>
+        bot.api.sendMessage(target.chatId, body, {
+          parse_mode: "HTML",
+          reply_markup: kb,
+          message_thread_id: target.threadId,
+        }),
+      );
+      this.askMessages.set(ask.id, { chatId: target.chatId, messageId: msg.message_id });
+      this.trackMsg(target.chatId, msg.message_id, sessionId);
     } catch (e) {
       if (e instanceof GrammyError) console.error("[telegram]", e.description);
     }
@@ -758,12 +1022,18 @@ export class TelegramBridge {
     // Only ping for claude sessions or non-zero shell exits to avoid noise.
     if (info.kind !== "claude" && !summary.isError) return;
 
+    // Tear down the live "working…" message — editing it wouldn't notify, so we
+    // remove it and post the result fresh (which does).
     const st = this.status.get(sessionId);
     if (st?.timer) clearTimeout(st.timer);
     this.status.delete(sessionId);
+    if (st && this.bot) {
+      await this.bot.api.deleteMessage(st.chatId, st.messageId).catch(() => {});
+    }
 
-    const chatId = st?.chatId ?? this.notifyChat();
-    if (!this.bot || !chatId) return;
+    const target =
+      this.sessionTarget(sessionId) ?? (st ? { chatId: st.chatId } : null);
+    if (!this.bot || !target) return;
 
     const icon = summary.isError ? "🔴" : "✅";
     const cost =
@@ -777,42 +1047,35 @@ export class TelegramBridge {
       truncated ? full.slice(0, BODY_LIMIT) + "…" : full,
     )}${note}${cost}`;
 
-    // Prefer editing the live status message into the final result.
-    let delivered = false;
-    if (st) {
-      delivered = await this.bot.api
-        .editMessageText(st.chatId, st.messageId, html, {
-          parse_mode: "HTML",
-          reply_markup: this.sessionKeyboard(sessionId),
-        })
-        .then(() => true)
-        .catch(() => false);
-    }
-    if (!delivered) {
-      delivered = await this.sendHtml(chatId, html, {
-        keyboard: this.sessionKeyboard(sessionId),
-        sessionId,
-      });
-    }
+    const delivered = await this.sendHtml(target.chatId, html, {
+      keyboard: this.sessionKeyboard(sessionId),
+      sessionId,
+      threadId: target.threadId,
+    });
     if (!delivered) {
       await this.bot.api
-        .sendMessage(chatId, `${icon} ${info.name}\n\n${full.slice(0, 3500)}`)
+        .sendMessage(target.chatId, `${icon} ${info.name}\n\n${full.slice(0, 3500)}`, {
+          message_thread_id: target.threadId,
+        })
         .catch(() => {});
     }
 
     // Long answers → attach the whole thing as markdown.
     if (truncated) {
       await this.sendDoc(
-        chatId,
+        target.chatId,
         new InputFile(Buffer.from(full, "utf8"), `${safeFilename(info.name)}-answer.md`),
-        sessionId,
+        { sessionId, threadId: target.threadId },
       );
     }
 
     // If Claude mentions files it created (e.g. ~/Downloads/report.docx),
     // attach them so they're usable straight from the phone.
     for (const f of extractMentionedFiles(full)) {
-      await this.sendDoc(chatId, new InputFile(f), sessionId);
+      await this.sendDoc(target.chatId, new InputFile(f), {
+        sessionId,
+        threadId: target.threadId,
+      });
     }
   }
 

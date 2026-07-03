@@ -21,6 +21,31 @@ function friendlyName(): string {
   }`;
 }
 
+// Filler words to drop when naming a session after its first task (EN + RU).
+const STOP = new Set([
+  "the", "a", "an", "to", "and", "or", "of", "in", "on", "for", "with", "at",
+  "please", "pls", "can", "could", "would", "you", "i", "me", "my", "we", "our",
+  "this", "that", "it", "is", "are", "be", "just", "some", "any", "let", "lets",
+  "help", "want", "need", "make", "do", "so", "then", "now", "also",
+  "и", "в", "на", "с", "по", "для", "что", "как", "это", "мне", "я", "ты", "бы",
+  "же", "чтобы", "пожалуйста", "надо", "нужно", "можешь", "мой", "моя", "тут",
+  "давай", "тип", "короче",
+]);
+
+/** Short, meaningful, branch-style name derived from the first task. */
+function smartName(prompt: string): string {
+  const firstSentence = prompt.split(/[.\n!?;]/)[0] ?? prompt;
+  const words = firstSentence
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .split(/[\s-]+/)
+    .filter(Boolean);
+  const keep = words.filter((w) => w.length > 1 && !STOP.has(w));
+  const picked = (keep.length ? keep : words).slice(0, 4);
+  const name = picked.join("-").replace(/^-+|-+$/g, "").slice(0, 28);
+  return name || friendlyName();
+}
+
 /**
  * Owns every live session. Typed event bus that the WS layer and the Telegram
  * bot both subscribe to — one source of truth for the multiplexer.
@@ -51,9 +76,13 @@ export class SessionManager extends EventEmitter {
     const cfg = this.config.get();
     const cwd = validCwd(req.cwd || cfg.claude.defaultCwd);
 
+    const autoName =
+      req.kind === "claude" && req.prompt?.trim()
+        ? smartName(req.prompt)
+        : friendlyName();
     const info: SessionInfo = {
       id,
-      name: req.name?.trim() || friendlyName(),
+      name: req.name?.trim() || autoName,
       kind: req.kind,
       cwd,
       status: "starting",
@@ -103,8 +132,21 @@ export class SessionManager extends EventEmitter {
 
     this.sessions.set(id, session);
     this.config.addRecentCwd(cwd);
+    this.emit("session_created", info);
     this.emit("sessions_changed");
     return info;
+  }
+
+  /** Last assistant/result text of a session — for previews and .md export. */
+  lastAnswer(id: string): { text: string; ts: number } | null {
+    const s = this.sessions.get(id);
+    if (!s) return null;
+    for (let i = s.events.length - 1; i >= 0; i--) {
+      const e = s.events[i];
+      if (e.kind === "result" || e.kind === "assistant")
+        return { text: e.text, ts: e.ts };
+    }
+    return null;
   }
 
   sendMessage(id: string, text: string): boolean {

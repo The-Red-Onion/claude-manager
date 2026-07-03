@@ -14,6 +14,7 @@ const DEFAULTS: AppConfig = {
     botToken: "",
     allowedUserIds: [],
     groupChatId: null,
+    filesTopicId: null,
     notifyChatId: null,
   },
   claude: {

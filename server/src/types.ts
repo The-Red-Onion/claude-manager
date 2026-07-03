@@ -100,6 +100,8 @@ export interface AppConfig {
     allowedUserIds: number[];
     /** Optional forum supergroup: one topic per session */
     groupChatId: number | null;
+    /** Topic id in the supergroup that archives every file the bot sends */
+    filesTopicId: number | null;
     /** Private chat to send pings to (captured on /start) */
     notifyChatId: number | null;
   };
