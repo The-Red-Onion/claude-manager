@@ -1,0 +1,21 @@
+{
+  "name": "claude-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted control center for Claude Code: session multiplexer, web dashboard, full terminal, Docker and a Telegram bot remote.",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @claude-manager/server start",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "node-pty",
+      "esbuild",
+      "@tailwindcss/oxide",
+      "@anthropic-ai/claude-agent-sdk"
+    ]
+  }
+}

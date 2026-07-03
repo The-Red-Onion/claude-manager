@@ -1,0 +1,77 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+@theme {
+  /* Brand — Firecrawl-style warm orange */
+  --color-brand-50: #fff5ef;
+  --color-brand-100: #ffe7d6;
+  --color-brand-200: #ffcbac;
+  --color-brand-300: #ffa877;
+  --color-brand-400: #fb7d40;
+  --color-brand-500: #f5541d;
+  --color-brand-600: #e2440f;
+  --color-brand-700: #bb350d;
+  --color-brand-800: #942c11;
+  --color-brand-900: #782812;
+
+  /* Neutral surfaces */
+  --color-canvas: #f7f6f4;
+  --color-surface: #ffffff;
+  --color-subtle: #faf9f7;
+  --color-line: #ebe9e4;
+  --color-line-strong: #ddd9d1;
+  --color-ink: #1b1a18;
+  --color-ink-soft: #45433f;
+  --color-muted: #79766e;
+  --color-faint: #a5a199;
+
+  /* Status */
+  --color-ok: #16a34a;
+  --color-warn: #d9930b;
+  --color-danger: #dc2626;
+
+  --font-sans:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono:
+    "JetBrains Mono", "SF Mono", ui-monospace, "Menlo", monospace;
+
+  --radius-card: 0.75rem;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  * {
+    border-color: var(--color-line);
+  }
+  ::selection {
+    background: var(--color-brand-100);
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 999px;
+    border: 3px solid var(--color-canvas);
+  }
+}
+
+/* Terminal fill */
+.xterm,
+.xterm-viewport {
+  height: 100% !important;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  border-color: #0c0c0c;
+}
